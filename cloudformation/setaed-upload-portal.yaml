@@ -1,0 +1,604 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SETA-ED District Upload Portal (S3 + CloudFront + ACM + API Gateway + Lambda + KMS + Email Notify)
+  - Static upload page behind CloudFront HTTPS
+  - Presigned S3 POST for direct upload to encrypted S3 bucket
+  - Upload-only; no district credentials required
+  - Email notification via SES to ivy@seta-ed.com with presigned download link
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: setaed-upload
+  HostedZoneId:
+    Type: String
+    Description: Route53 hosted zone ID for your domain (for creating DNS record). Optional if not using Route53.
+    Default: ""
+  SiteDomainName:
+    Type: String
+    Description: Custom domain for the upload portal (e.g., data.seta-ed.com). Leave blank to use CloudFront domain.
+    Default: "data.seta-ed.com"
+  AcmCertificateArn:
+    Type: String
+    Description: ACM cert ARN in us-east-1 for SiteDomainName. Required if SiteDomainName is set.
+    Default: ""
+  MaxUploadBytes:
+    Type: Number
+    Default: 1073741824  # 1 GB
+  PresignExpirySeconds:
+    Type: Number
+    Default: 900         # 15 minutes
+  UploadDataBucketName:
+    Type: String
+    Description: Optional fixed name for the upload data bucket. Leave blank to auto-generate.
+    Default: ""
+  NotifyToEmail:
+    Type: String
+    Default: ivy@seta-ed.com
+  NotifyFromEmail:
+    Type: String
+    Default: uploads@seta-ed.com
+  DownloadLinkExpirySeconds:
+    Type: Number
+    Default: 604800  # 7 days
+
+Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref SiteDomainName, ""]]
+  CreateRoute53Record: !And
+    - !Condition UseCustomDomain
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+  UseCustomUploadBucketName: !Not [!Equals [!Ref UploadDataBucketName, ""]]
+
+Resources:
+
+  # =========================
+  # KMS Key for data bucket
+  # =========================
+  UploadKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "${ProjectName} KMS key for encrypting district uploads (SSE-KMS)"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowS3UseOfKey
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  UploadKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-upload-kms"
+      TargetKeyId: !Ref UploadKmsKey
+
+  # =========================
+  # S3 Bucket for uploaded district data (private)
+  # =========================
+  UploadDataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - UploadNotifyInvokePermission
+    Properties:
+      BucketName: !If
+        - UseCustomUploadBucketName
+        - !Ref UploadDataBucketName
+        - !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref UploadKmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt UploadNotifyLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !If
+                - UseCustomDomain
+                - !Sub "https://${SiteDomainName}"
+                - "*"
+            AllowedMethods:
+              - POST
+              - PUT
+              - GET
+              - HEAD
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+              - x-amz-request-id
+              - x-amz-id-2
+            MaxAge: 3000
+
+
+  UploadDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+      - UploadDataBucket
+    Properties:
+      Bucket: !If
+        - UseCustomUploadBucketName
+        - !Ref UploadDataBucketName
+        - !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !If
+              - UseCustomUploadBucketName
+              - !Sub "arn:aws:s3:::${UploadDataBucketName}/*"
+              - !Sub "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !If
+              - UseCustomUploadBucketName
+              - !Sub "arn:aws:s3:::${UploadDataBucketName}/*"
+              - !Sub "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: "aws:kms"
+
+  # =========================
+  # Site Bucket (static portal assets) - private behind CloudFront
+  # =========================
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-site-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: siteOrigin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref SiteOAC
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: siteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: ["GET", "HEAD", "OPTIONS"]
+          CachedMethods: ["GET", "HEAD", "OPTIONS"]
+          Compress: true
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: none
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Aliases: !If
+          - UseCustomDomain
+          - [!Ref SiteDomainName]
+          - !Ref "AWS::NoValue"
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${SiteBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  SiteDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateRoute53Record
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SiteDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  # =========================
+  # Presign Lambda + API Gateway
+  # =========================
+  PresignLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-presign-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-presign-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource: !If
+                  - UseCustomUploadBucketName
+                  - !Sub "arn:aws:s3:::${UploadDataBucketName}"
+                  - !Sub "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource: !If
+                  - UseCustomUploadBucketName
+                  - !Sub "arn:aws:s3:::${UploadDataBucketName}/*"
+                  - !Sub "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads/*"
+              - Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey
+                Resource: !GetAtt UploadKmsKey.Arn
+
+  PresignLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-presign"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt PresignLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET: !If
+            - UseCustomUploadBucketName
+            - !Ref UploadDataBucketName
+            - !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
+          KMS_KEY_ID: !GetAtt UploadKmsKey.Arn
+          MAX_SIZE: !Ref MaxUploadBytes
+          EXPIRES: !Ref PresignExpirySeconds
+      Code:
+        ZipFile: |
+          import json, os, re
+          import boto3
+          from botocore.config import Config
+          from datetime import datetime, timezone
+
+          s3 = boto3.client("s3", config=Config(signature_version="s3v4"))
+
+          BUCKET = os.environ["BUCKET"]
+          KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+          MAX_SIZE = int(os.environ.get("MAX_SIZE", "1073741824"))
+          EXPIRES = int(os.environ.get("EXPIRES", "900"))
+
+          def slugify(name: str) -> str:
+              name = name.strip().lower()
+              name = re.sub(r"[^a-z0-9]+", "_", name)
+              name = re.sub(r"_+", "_", name).strip("_")
+              return name[:80] if name else "unknown_district"
+
+          def handler(event, context):
+              try:
+                  raw = event.get("body") or "{}"
+                  body = json.loads(raw)
+
+                  district = (body.get("district") or "").strip()
+                  email = (body.get("email") or "").strip()
+                  filename = (body.get("filename") or "").strip()
+                  content_type = body.get("contentType") or "application/octet-stream"
+
+                  if not district or not email or not filename:
+                      return resp(400, {"error": "district, email, filename are required"})
+
+                  filename = os.path.basename(filename)
+
+                  now = datetime.now(timezone.utc)
+                  district_slug = slugify(district)
+                  ts = now.strftime("%Y%m%d_%H%M%S")
+
+                  key = f"uploads/{district_slug}/{now:%Y/%m}/{ts}__{filename}"
+
+                  fields = {
+                      "key": key,
+                      "x-amz-server-side-encryption": "aws:kms",
+                      "x-amz-server-side-encryption-aws-kms-key-id": KMS_KEY_ID,
+                      "Content-Type": content_type,
+                      "x-amz-meta-district": district,
+                      "x-amz-meta-email": email
+                  }
+
+                  conditions = [
+                      ["content-length-range", 1, MAX_SIZE],
+                      {"key": key},
+                      {"x-amz-server-side-encryption": "aws:kms"},
+                      {"x-amz-server-side-encryption-aws-kms-key-id": KMS_KEY_ID},
+                      {"Content-Type": content_type},
+                      {"x-amz-meta-district": district},
+                      {"x-amz-meta-email": email}
+                  ]
+
+                  presigned = s3.generate_presigned_post(
+                      Bucket=BUCKET,
+                      Key=key,
+                      Fields=fields,
+                      Conditions=conditions,
+                      ExpiresIn=EXPIRES
+                  )
+
+                  return resp(200, {"upload": presigned, "key": key})
+              except Exception as e:
+                  return resp(500, {"error": str(e)})
+
+          def resp(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "content-type",
+                      "Access-Control-Allow-Methods": "POST,OPTIONS"
+                  },
+                  "body": json.dumps(body)
+              }
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-http-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods: ["POST", "OPTIONS"]
+        AllowHeaders: ["content-type"]
+        AllowOrigins: ["*"]
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PresignLambda.Arn
+      PayloadFormatVersion: "2.0"
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /presign"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PresignLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*"
+
+  # =========================
+  # Upload Notification Lambda (SES)
+  # =========================
+  UploadNotifyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-upload-notify-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-upload-notify-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:HeadObject
+                  - s3:GetObject
+                Resource: !If
+                  - UseCustomUploadBucketName
+                  - !Sub "arn:aws:s3:::${UploadDataBucketName}/*"
+                  - !Sub "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads/*"
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt UploadKmsKey.Arn
+
+  UploadNotifyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-upload-notify"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt UploadNotifyLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TO_EMAIL: !Ref NotifyToEmail
+          FROM_EMAIL: !Ref NotifyFromEmail
+          LINK_EXPIRY: !Ref DownloadLinkExpirySeconds
+      Code:
+        ZipFile: |
+          import os, boto3, urllib.parse
+          from botocore.config import Config
+          s3 = boto3.client("s3", config=Config(signature_version="s3v4"))
+          ses = boto3.client("ses")
+
+          TO_EMAIL = os.environ["TO_EMAIL"]
+          FROM_EMAIL = os.environ["FROM_EMAIL"]
+          LINK_EXPIRY = int(os.environ.get("LINK_EXPIRY", "604800"))
+          TO_EMAILS = [e.strip() for e in TO_EMAIL.split(",") if e.strip()]
+
+          def handler(event, context):
+              for record in event.get("Records", []):
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+                  if not key.startswith("uploads/"):
+                      continue
+
+                  head = s3.head_object(Bucket=bucket, Key=key)
+                  meta = head.get("Metadata", {})
+                  district = meta.get("district", "Unknown")
+                  submitter_email = meta.get("email", "Unknown")
+
+                  size_bytes = head.get("ContentLength", 0)
+                  last_modified = head.get("LastModified")
+
+                  url = s3.generate_presigned_url(
+                      "get_object",
+                      Params={"Bucket": bucket, "Key": key},
+                      ExpiresIn=LINK_EXPIRY
+                  )
+
+                  subject = f"[SETA-ED Upload] New file received from {district}"
+                  size_mb = round(size_bytes / 1024 / 1024, 2)
+                  hours = LINK_EXPIRY // 3600
+
+                  body = (
+                      "A new district upload has been received.\n\n"
+                      f"District: {district}\n"
+                      f"Submitted by (email): {submitter_email}\n"
+                      f"S3 Bucket: {bucket}\n"
+                      f"S3 Key: {key}\n"
+                      f"Size: {size_mb} MB\n"
+                      f"Last Modified: {last_modified}\n\n"
+                      f"Download link (expires in {hours} hours):\n"
+                      f"{url}\n"
+                  )
+
+
+                  
+
+                  ses.send_email(
+                      Source=FROM_EMAIL,
+                      Destination={"ToAddresses": TO_EMAILS},
+                      Message={
+                          "Subject": {"Data": subject},
+                          "Body": {"Text": {"Data": body}}
+                      }
+                  )
+              return {"status":"ok"}
+
+  UploadNotifyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadNotifyLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !If
+        - UseCustomUploadBucketName
+        - !Sub "arn:aws:s3:::${UploadDataBucketName}"
+        - !Sub "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
+
+Outputs:
+  UploadDataBucketName:
+    Description: Bucket for uploaded district data (encrypted, private)
+    Value: !Ref UploadDataBucket
+  SiteBucketName:
+    Description: Bucket for static portal assets (private behind CloudFront)
+    Value: !Ref SiteBucket
+  HttpApiEndpoint:
+    Description: HTTP API endpoint (use /presign)
+    Value: !Sub "${HttpApi.ApiEndpoint}"
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt SiteDistribution.DomainName
+  PortalUrl:
+    Description: URL of the portal
+    Value: !If
+      - UseCustomDomain
+      - !Sub "https://${SiteDomainName}/"
+      - !Sub "https://${SiteDistribution.DomainName}/"

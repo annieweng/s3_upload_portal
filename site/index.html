@@ -1,0 +1,374 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SETA-ED Secure Upload</title>
+  <link rel="icon" href="favicon.ico"/>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap");
+    :root {
+      --ink: #1b1a17;
+      --muted: #6b655c;
+      --accent: hsl(199, 53%, 56%);
+      --accent-2: hsl(199, 53%, 46%);
+      --paper: hsl(33, 18%, 90%);
+      --card: #ffffff;
+      --line: rgba(27, 26, 23, 0.12);
+      --shadow: 0 18px 50px rgba(40, 32, 20, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, hsl(33, 20%, 92%) 0%, hsl(33, 18%, 90%) 45%, hsl(33, 17%, 88%) 100%);
+    }
+    .orb {
+      position: fixed;
+      width: 320px;
+      height: 320px;
+      border-radius: 50%;
+      filter: blur(40px);
+      opacity: 0.25;
+      z-index: 0;
+      pointer-events: none;
+      animation: float 12s ease-in-out infinite;
+    }
+    .orb.a { background: hsla(199, 53%, 56%, 0.35); top: -140px; left: -80px; }
+    .orb.b { background: hsla(199, 53%, 46%, 0.3); bottom: -160px; right: -80px; animation-delay: -4s; }
+    .page {
+      position: relative;
+      z-index: 1;
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 56px 20px 80px;
+      display: grid;
+      gap: 24px;
+    }
+    .hero {
+      display: grid;
+      gap: 12px;
+    }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 3.4vw, 46px);
+      line-height: 1.05;
+      font-weight: 700;
+      color: #6d2e46;
+    }
+    h2 { color: #6d2e46; }
+    .lede {
+      margin: 0;
+      font-size: 16px;
+      color: var(--muted);
+      max-width: 640px;
+    }
+    .panel {
+      background: var(--card);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+      padding: 28px;
+      border: 1px solid rgba(17, 24, 39, 0.06);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input[type="text"], input[type="email"] {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      font-size: 15px;
+      background: #fff;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    input:focus {
+      outline: none;
+      border-color: rgba(47, 127, 192, 0.55);
+      box-shadow: 0 0 0 3px rgba(47, 127, 192, 0.18);
+    }
+    .box {
+      border: 2px dashed rgba(17, 24, 39, 0.18);
+      border-radius: 16px;
+      padding: 24px;
+      text-align: center;
+      color: var(--muted);
+      background: linear-gradient(160deg, rgba(83, 165, 203, 0.12), rgba(83, 165, 203, 0.04));
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+    .box.dragover {
+      border-color: var(--accent-2);
+      transform: translateY(-2px);
+      color: var(--ink);
+      background: linear-gradient(160deg, rgba(47, 127, 192, 0.18), rgba(15, 76, 129, 0.1));
+    }
+    .file-row {
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .file-input {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .file-input input[type="file"] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-top: 16px;
+    }
+    button {
+      border: none;
+      border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      padding: 12px 20px;
+      cursor: pointer;
+      box-shadow: 0 10px 24px rgba(15, 76, 129, 0.25);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    button:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(15, 76, 129, 0.28); }
+    button:active { transform: translateY(0); }
+    .hint {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .status-wrap {
+      margin-top: 18px;
+      display: grid;
+      gap: 8px;
+    }
+    progress {
+      width: 100%;
+      height: 14px;
+      border: none;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(17, 24, 39, 0.08);
+    }
+    progress::-webkit-progress-bar { background: rgba(17, 24, 39, 0.08); }
+    progress::-webkit-progress-value { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+    progress::-moz-progress-bar { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+    .small { font-size: 13px; color: var(--muted); }
+    .ok { color: #0b8b56; }
+    .err { color: #b00020; }
+    .meta {
+      display: grid;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .meta span { display: inline-block; padding: 6px 10px; border-radius: 999px; background: rgba(17, 24, 39, 0.06); }
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(14px); }
+    }
+    @media (max-width: 700px) {
+      .panel { padding: 20px; }
+      .actions { flex-direction: column; align-items: stretch; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="orb a"></div>
+  <div class="orb b"></div>
+
+  <div class="page">
+    <div class="hero">
+      <div class="eyebrow">SETA-ED Data</div>
+      <h2>SETA-ED Data Upload Portal</h2>
+      <p class="lede">We encrypt files in transit and at rest, and notify our team the moment your upload completes.</p>
+    </div>
+
+    <div class="panel">
+      <div class="grid">
+        <div>
+          <label for="district">District Name</label>
+          <input id="district" type="text" placeholder="e.g., Springfield School District"/>
+        </div>
+        <div>
+          <label for="email">Email</label>
+          <input id="email" type="email" placeholder="e.g., admin@district.edu"/>
+        </div>
+      </div>
+
+      <div id="drop" class="box" style="margin-top:16px;">
+        <strong>Drag & drop your file</strong>
+        <div class="small">or choose a file from your computer</div>
+        <div class="file-row">
+          <label class="file-input">
+            Select file
+            <input id="file" type="file"/>
+          </label>
+          <div class="hint" id="fileHint">No file selected</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="uploadBtn">Upload</button>
+        <div class="hint">Uploads are encrypted with AWS KMS</div>
+      </div>
+
+      <div class="status-wrap">
+        <progress id="progress" value="0" max="100"></progress>
+        <div id="status" class="small"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/**
+ * After deploying the CloudFormation stack, set API_BASE to the HttpApiEndpoint output.
+ * Example: https://abc123.execute-api.us-east-1.amazonaws.com
+ */
+const API_BASE = "https://mfqbkcm755.execute-api.us-east-1.amazonaws.com";
+let selectedFile = null;
+
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+const uploadBtn = document.getElementById("uploadBtn");
+const progress = document.getElementById("progress");
+const statusEl = document.getElementById("status");
+const fileHint = document.getElementById("fileHint");
+
+function setStatus(msg, cls="") {
+  statusEl.className = "small " + cls;
+  statusEl.textContent = msg;
+}
+
+fileInput.addEventListener("change", (e) => {
+  selectedFile = e.target.files[0];
+  if (selectedFile) {
+    const sizeMb = Math.round(selectedFile.size / 1024 / 1024);
+    const label = `${selectedFile.name} (${sizeMb} MB)`;
+    fileHint.textContent = label;
+    setStatus(`Selected: ${label}`);
+  } else {
+    fileHint.textContent = "No file selected";
+  }
+});
+
+drop.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  drop.classList.add("dragover");
+});
+drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  drop.classList.remove("dragover");
+  selectedFile = e.dataTransfer.files[0];
+  if (selectedFile) {
+    const sizeMb = Math.round(selectedFile.size / 1024 / 1024);
+    const label = `${selectedFile.name} (${sizeMb} MB)`;
+    fileHint.textContent = label;
+    setStatus(`Selected: ${label}`);
+  } else {
+    fileHint.textContent = "No file selected";
+  }
+});
+
+uploadBtn.addEventListener("click", async () => {
+  const district = document.getElementById("district").value.trim();
+  const email = document.getElementById("email").value.trim();
+  if (!district || !email) return setStatus("District name and email are required.", "err");
+  if (!selectedFile) return setStatus("Please choose a file to upload.", "err");
+
+  if (selectedFile.size > 1024*1024*1024) {
+    return setStatus("File too large. Max 1GB.", "err");
+  }
+
+  progress.value = 0;
+  setStatus("Requesting upload authorization...");
+
+  const presignResp = await fetch(`${API_BASE}/presign`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      district,
+      email,
+      filename: selectedFile.name,
+      contentType: selectedFile.type || "application/octet-stream"
+    })
+  });
+
+  if (!presignResp.ok) {
+    const err = await presignResp.text();
+    return setStatus("Failed to get upload link: " + err, "err");
+  }
+
+  const { upload, key } = await presignResp.json();
+
+  const formData = new FormData();
+  Object.entries(upload.fields).forEach(([k,v]) => formData.append(k, v));
+  formData.append("file", selectedFile);
+
+  setStatus("Uploading... (do not close this tab)");
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", upload.url, true);
+
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) {
+      const pct = Math.round((e.loaded / e.total) * 100);
+      progress.value = pct;
+      setStatus(`Uploading... ${pct}%`);
+    }
+  };
+
+  xhr.onload = () => {
+    if (xhr.status === 204 || xhr.status === 201) {
+      progress.value = 100;
+      setStatus(`✅ Upload complete!`, "ok");
+      setStatus(`✅ Thanks! Your file was uploaded successfully. Our team has been notified.`, "ok");
+      selectedFile = null;
+      fileInput.value = "";
+      fileHint.textContent = "No file selected";
+    } else {
+      setStatus(`Upload failed (${xhr.status}).`, "err");
+    }
+  };
+
+  xhr.onerror = () => setStatus("Upload failed due to network error.", "err");
+  xhr.send(formData);
+});
+</script>
+</body>
+</html>
