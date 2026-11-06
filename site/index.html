@@ -164,6 +164,11 @@
       box-shadow: 0 10px 24px rgba(15, 76, 129, 0.25);
       transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
     button:hover { transform: translateY(-1px); box-shadow: 0 14px 30px rgba(15, 76, 129, 0.28); }
     button:active { transform: translateY(0); }
     .hint {
@@ -219,14 +224,19 @@
     </div>
 
     <div class="panel">
-      <div class="grid">
+      <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
         <div>
           <label for="district">District Name</label>
           <input id="district" type="text" placeholder="e.g., Springfield School District"/>
         </div>
         <div>
           <label for="email">Email</label>
-          <input id="email" type="email" placeholder="e.g., admin@district.edu"/>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <input id="email" type="email" placeholder="e.g., admin@district.edu"/>
+            <a id="verifyEmailLink" href="#" class="small" style="display:none; color:#b00020; white-space:nowrap;">Verify email</a>
+            <a id="refreshStatusLink" href="#" class="small" style="display:none; white-space:nowrap;">Refresh status</a>
+          </div>
+          <div id="emailStatus" class="small"></div>
         </div>
       </div>
 
@@ -243,7 +253,7 @@
       </div>
 
       <div class="actions">
-        <button id="uploadBtn">Upload</button>
+        <button id="uploadBtn" disabled>Upload</button>
         <div class="hint">Uploads are encrypted with AWS KMS</div>
       </div>
 
@@ -268,11 +278,126 @@ const uploadBtn = document.getElementById("uploadBtn");
 const progress = document.getElementById("progress");
 const statusEl = document.getElementById("status");
 const fileHint = document.getElementById("fileHint");
+const emailInput = document.getElementById("email");
+const emailStatus = document.getElementById("emailStatus");
+const verifyEmailLink = document.getElementById("verifyEmailLink");
+const refreshStatusLink = document.getElementById("refreshStatusLink");
+let emailVerified = false;
+let verificationRequested = false;
 
 function setStatus(msg, cls="") {
   statusEl.className = "small " + cls;
   statusEl.textContent = msg;
 }
+
+function setEmailStatus(msg, cls="") {
+  emailStatus.className = "small " + cls;
+  emailStatus.textContent = msg;
+}
+
+async function checkEmailVerification(email) {
+  try {
+    const res = await fetch(`${API_BASE}/verify-check?email=${encodeURIComponent(email)}`);
+    if (!res.ok) {
+      setEmailStatus("Unable to verify email status.", "err");
+      emailVerified = false;
+      verifyEmailLink.style.display = "inline";
+      refreshStatusLink.style.display = verificationRequested ? "inline" : "none";
+      uploadBtn.disabled = true;
+      return;
+    }
+    const data = await res.json();
+    emailVerified = !!data.verified;
+    if (emailVerified) {
+      setEmailStatus("Email verified ✅", "ok");
+      verifyEmailLink.style.display = "none";
+      refreshStatusLink.style.display = "none";
+      uploadBtn.disabled = false;
+    } else {
+      setEmailStatus("Email not verified yet.", "err");
+      verifyEmailLink.style.display = "inline";
+      refreshStatusLink.style.display = verificationRequested ? "inline" : "none";
+      uploadBtn.disabled = true;
+    }
+  } catch (err) {
+    setEmailStatus("Unable to verify email status.", "err");
+    emailVerified = false;
+    verifyEmailLink.style.display = "inline";
+    refreshStatusLink.style.display = verificationRequested ? "inline" : "none";
+    uploadBtn.disabled = true;
+  }
+}
+
+let emailCheckTimer = null;
+emailInput.addEventListener("input", () => {
+  const email = emailInput.value.trim();
+  emailVerified = false;
+  verificationRequested = false;
+  uploadBtn.disabled = true;
+  if (!email) {
+    setEmailStatus("");
+    verifyEmailLink.style.display = "none";
+    refreshStatusLink.style.display = "none";
+    return;
+  }
+  setEmailStatus("Checking email...", "");
+  verifyEmailLink.style.display = "none";
+  refreshStatusLink.style.display = "none";
+  if (emailCheckTimer) clearTimeout(emailCheckTimer);
+  emailCheckTimer = setTimeout(() => checkEmailVerification(email), 600);
+});
+
+verifyEmailLink.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const email = emailInput.value.trim();
+  if (!email) {
+    setEmailStatus("Please enter an email first.", "err");
+    return;
+  }
+  try {
+    verifyEmailLink.style.pointerEvents = "none";
+    setEmailStatus("Sending verification email...", "");
+    const res = await fetch(`${API_BASE}/verify-request`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ email })
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      setEmailStatus("Failed to send verification email.", "err");
+      return;
+    }
+    const data = await res.json();
+    if (data.verified) {
+      emailVerified = true;
+      verificationRequested = false;
+      uploadBtn.disabled = false;
+      setEmailStatus("Email verified ✅", "ok");
+      verifyEmailLink.style.display = "none";
+      refreshStatusLink.style.display = "none";
+    } else {
+      verificationRequested = true;
+      setEmailStatus("Verification email sent. Check your inbox.", "ok");
+      verifyEmailLink.style.display = "none";
+      refreshStatusLink.style.display = "inline";
+    }
+  } catch (err) {
+    setEmailStatus("Failed to send verification email.", "err");
+  } finally {
+    verifyEmailLink.style.pointerEvents = "auto";
+  }
+});
+
+refreshStatusLink.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const email = emailInput.value.trim();
+  if (!email) {
+    setEmailStatus("Please enter an email first.", "err");
+    return;
+  }
+  setEmailStatus("Checking email...", "");
+  await checkEmailVerification(email);
+});
 
 fileInput.addEventListener("change", (e) => {
   selectedFile = e.target.files[0];
@@ -309,6 +434,7 @@ uploadBtn.addEventListener("click", async () => {
   const district = document.getElementById("district").value.trim();
   const email = document.getElementById("email").value.trim();
   if (!district || !email) return setStatus("District name and email are required.", "err");
+  if (!emailVerified) return setStatus("Please verify your email before uploading.", "err");
   if (!selectedFile) return setStatus("Please choose a file to upload.", "err");
 
   if (selectedFile.size > 1024*1024*1024) {
